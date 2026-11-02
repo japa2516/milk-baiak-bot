@@ -1,1 +1,750 @@
 
+// ==UserScript==
+// @name         Milk Baiak Bot
+// @namespace    nexus
+// @version      1.2.0
+// @description  Milk Baiak Bot: auto sell, cliques, alertas e modo stream (versao expandida)
+// @match        https://baiakidle.com/*
+// @match        https://*.baiakidle.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  if (window.__milkBaiak) { try { window.__milkBaiak.destroy(); } catch (_) {} }
+
+  const STORE = 'milk_baiak_cfg_v1';
+  const HOST_ID = 'milk-baiak-host';
+
+  const T = (texts, sel = '') => ({ texts, sel });
+  const DEFAULTS = {
+    master: false,
+    keepAwake: false,
+    pauseWhenHidden: false,
+    opacity: 100,
+    hideKey: 'F8',
+    showKey: 'F9',
+    sell: {
+      enabled: true,
+      mode: 'full',
+      threshold: 100,
+      interval: 120,
+      counterSel: '',
+      fullTexts: 'backpack cheia,mochila cheia,backpack full,inventory full,inventario cheio,bag full',
+      open: T('backpack,mochila,inventario'),
+      sell: T('vender tudo,sell all,vender,sell'),
+      confirm: T('confirmar,confirm,sim,yes'),
+      close: T('fechar,close'),
+    },
+    rules: [
+      { id: 'r1', name: 'Reiniciar hunt', enabled: false, every: 5, texts: 'iniciar hunt,start hunt,iniciar caca,reiniciar', sel: '' },
+      { id: 'r2', name: 'Coletar recompensas', enabled: false, every: 10, texts: 'coletar tudo,coletar,collect all,collect,resgatar,claim', sel: '' },
+      { id: 'r3', name: 'Iniciar Auto Boss', enabled: false, every: 15, texts: 'iniciar auto boss,start auto boss', sel: '' },
+      { id: 'r4', name: 'Fechar avisos', enabled: false, every: 5, texts: 'ok,fechar,close,continuar', sel: '' },
+    ],
+    alerts: {
+      sound: true,
+      notify: true,
+      disconnect: { enabled: true, texts: 'desconectado,disconnected,conexao perdida,connection lost,sessao expirada', reload: true, after: 20 },
+      death: { enabled: true, texts: 'voce morreu,you died,voce foi derrotado,party wipe' },
+      stamina: { enabled: false, below: 15 },
+    },
+  };
+
+  const clone = o => JSON.parse(JSON.stringify(o));
+  const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
+  const merge = (base, over) => {
+    const out = clone(base);
+    if (!isObj(over)) return out;
+    for (const k of Object.keys(over)) {
+      if (isObj(out[k]) && isObj(over[k])) out[k] = merge(out[k], over[k]);
+      else if (k in out && typeof out[k] === typeof over[k]) out[k] = over[k];
+    }
+    return out;
+  };
+  const loadCfg = () => {
+    try { return merge(DEFAULTS, JSON.parse(localStorage.getItem(STORE) || '{}')); }
+    catch (_) { return clone(DEFAULTS); }
+  };
+  let cfg = loadCfg();
+  const save = () => { try { localStorage.setItem(STORE, JSON.stringify(cfg)); } catch (_) {} };
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const norm = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const list = s => String(s || '').split(',').map(norm).filter(Boolean);
+  const matchText = (t, p) => {
+    if (!t || !p) return false;
+    return t === p || (p.length > 2 && t.includes(p) && t.length <= p.length + 24);
+  };
+  const pad = n => String(n).padStart(2, '0');
+
+  const stats = { clicks: 0, sells: 0, start: Date.now() };
+  const logs = [];
+  let logEl = null;
+  const log = msg => {
+    const d = new Date();
+    logs.push(`[${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}] ${msg}`);
+    if (logs.length > 80) logs.shift();
+    if (logEl && logEl.isConnected) { logEl.textContent = logs.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+  };
+
+  const h = (tag, props = {}, ...kids) => {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) {
+      if (k === 'class') e.className = v;
+      else if (k === 'style') e.style.cssText = v;
+      else if (k === 'value' || k === 'checked') e[k] = v;
+      else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+      else if (v !== undefined && v !== null) e.setAttribute(k, v);
+    }
+    for (const kid of kids.flat()) {
+      if (kid === null || kid === undefined) continue;
+      e.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    }
+    return e;
+  };
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity) > 0.05;
+  }
+  function isEnabled(el) {
+    let n = el;
+    for (let i = 0; i < 4 && n; i++, n = n.parentElement) {
+      if (n.disabled === true || n.getAttribute('aria-disabled') === 'true') return false;
+      if (typeof n.className === 'string' && /(^|\s)disabled(\s|$)/.test(n.className)) return false;
+    }
+    return true;
+  }
+  function findByTexts(texts) {
+    const pats = list(texts);
+    if (!pats.length || !document.body) return null;
+    for (const i of document.querySelectorAll('input[type="button"],input[type="submit"]')) {
+      const v = norm(i.value);
+      if (pats.some(p => matchText(v, p)) && isVisible(i) && isEnabled(i)) return i;
+    }
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while (w.nextNode()) {
+      const n = w.currentNode;
+      const raw = n.nodeValue;
+      if (!raw || raw.length > 60) continue;
+      const t = norm(raw);
+      if (!t || !pats.some(p => matchText(t, p))) continue;
+      const el = n.parentElement;
+      if (!el) continue;
+      const tag = el.tagName;
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') continue;
+      if (isVisible(el) && isEnabled(el)) return el;
+    }
+    return null;
+  }
+  function resolve(t) {
+    if (t.sel) {
+      try {
+        const e = document.querySelector(t.sel);
+        if (e && isVisible(e) && isEnabled(e)) return e;
+      } catch (_) {}
+    }
+    return t.texts ? findByTexts(t.texts) : null;
+  }
+  function humanClick(el) {
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width * rand(0.3, 0.7);
+    const y = r.top + r.height * rand(0.3, 0.7);
+    const base = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+    const fire = (type, Ctor) => { try { el.dispatchEvent(new Ctor(type, { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch (_) {} };
+    const PE = window.PointerEvent || MouseEvent;
+    fire('pointerover', PE); fire('mouseover', MouseEvent);
+    fire('pointerdown', PE); fire('mousedown', MouseEvent);
+    fire('pointerup', PE); fire('mouseup', MouseEvent);
+    try { el.click(); } catch (_) { fire('click', MouseEvent); }
+  }
+  const describe = el => el ? `<${el.tagName.toLowerCase()}> "${(el.textContent || '').trim().slice(0, 30)}"` : 'NAO ENCONTRADO';
+  function flash(el) {
+    const old = el.style.outline;
+    el.style.outline = '3px solid #ff1a1a';
+    setTimeout(() => { el.style.outline = old; }, 1500);
+  }
+  function testTarget(name, t) {
+    const el = resolve(t);
+    log(`teste ${name}: ${describe(el)}`);
+    if (el) flash(el);
+    return el;
+  }
+  let btCache = '', btAt = 0;
+  function bodyText() {
+    const n = Date.now();
+    if (n - btAt > 700) { btCache = norm(document.body ? document.body.innerText : ''); btAt = n; }
+    return btCache;
+  }
+  async function waitFor(fn, ms) {
+    const end = Date.now() + ms;
+    for (;;) {
+      const v = fn();
+      if (v) return v;
+      if (Date.now() > end) return null;
+      await sleep(150);
+    }
+  }
+
+  function readCounter() {
+    const re = /(\d+)\s*\/\s*(\d+)/;
+    if (cfg.sell.counterSel) {
+      try {
+        const e = document.querySelector(cfg.sell.counterSel);
+        const m = e && e.textContent.match(re);
+        if (m && +m[2] > 0) return { cur: +m[1], max: +m[2] };
+      } catch (_) {}
+      return null;
+    }
+    if (!document.body) return null;
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while (w.nextNode()) {
+      const n = w.currentNode;
+      const raw = n.nodeValue;
+      if (!raw || raw.length > 40) continue;
+      const m = norm(raw).match(re);
+      if (!m || +m[2] <= 0) continue;
+      let el = n.parentElement, ctx = norm(raw);
+      for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
+        const tc = el.textContent || '';
+        if (tc.length < 200) ctx += ' ' + norm(tc);
+      }
+      if (/backpack|mochila|inventario|\bbag\b|slots/.test(ctx) && isVisible(n.parentElement)) {
+        return { cur: +m[1], max: +m[2] };
+      }
+    }
+    return null;
+  }
+
+  let sellBusy = false, lastSell = 0, lastSellFail = 0, lastSellCheck = 0;
+  async function doSell(reason) {
+    if (sellBusy) return;
+    sellBusy = true;
+    const s = cfg.sell;
+    try {
+      let opened = false;
+      let sellEl = resolve(s.sell);
+      if (!sellEl) {
+        const o = resolve(s.open);
+        if (o) {
+          humanClick(o); stats.clicks++; opened = true;
+          await sleep(rand(600, 1000));
+          sellEl = await waitFor(() => resolve(s.sell), 2500);
+        }
+      }
+      if (!sellEl) {
+        lastSellFail = Date.now();
+        log('sell: botao de vender nao encontrado (use Testar na aba Sell)');
+        return;
+      }
+      humanClick(sellEl); stats.clicks++;
+      await sleep(rand(400, 800));
+      const cf = await waitFor(() => resolve(s.confirm), 1500);
+      if (cf) { humanClick(cf); stats.clicks++; await sleep(rand(300, 600)); }
+      if (opened) {
+        const cl = resolve(s.close);
+        if (cl) { humanClick(cl); stats.clicks++; }
+      }
+      stats.sells++;
+      lastSell = Date.now();
+      log(`sell executado (${reason})`);
+    } catch (e) {
+      lastSellFail = Date.now();
+      log('sell erro: ' + e.message);
+    } finally {
+      sellBusy = false;
+    }
+  }
+  function checkSell(now) {
+    if (sellBusy) return;
+    const s = cfg.sell;
+    if (s.mode === 'timer') {
+      if (now - lastSell >= Math.max(5, s.interval) * 1000) { lastSell = now; doSell('timer'); }
+      return;
+    }
+    if (now - lastSellFail < 15000 || now - lastSell < 6000) return;
+    const c = readCounter();
+    const pct = c ? (c.cur / c.max) * 100 : 0;
+    const bt = bodyText();
+    const txtFull = list(s.fullTexts).some(p => bt.includes(p));
+    if ((c && pct >= s.threshold) || txtFull) doSell(c ? `backpack ${c.cur}/${c.max}` : 'texto de cheia');
+  }
+
+  function beep() {
+    try {
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.connect(g); g.connect(ac.destination);
+      o.type = 'square'; o.frequency.value = 880; g.gain.value = 0.05;
+      o.start(); o.stop(ac.currentTime + 0.25);
+      setTimeout(() => { try { ac.close(); } catch (_) {} }, 600);
+    } catch (_) {}
+  }
+  function notify(title, body) {
+    log(`ALERTA: ${title} - ${body}`);
+    if (cfg.alerts.sound) beep();
+    if (cfg.alerts.notify && 'Notification' in window && Notification.permission === 'granted') {
+      try { new Notification(title, { body }); } catch (_) {}
+    }
+  }
+  function readStamina() {
+    const m = bodyText().match(/stamina\D{0,20}?(\d{1,3}(?:[.,]\d+)?)\s*%/);
+    return m ? parseFloat(m[1].replace(',', '.')) : null;
+  }
+  let discSince = 0, deathSeen = false, lowStamina = false;
+  let lastReload = Number(sessionStorage.getItem('milk_reload') || 0);
+  function watch(now) {
+    const a = cfg.alerts, bt = bodyText();
+    if (a.disconnect.enabled) {
+      const present = list(a.disconnect.texts).some(p => bt.includes(p));
+      if (present) {
+        if (!discSince) { discSince = now; notify('Desconectado', 'O jogo mostrou aviso de desconexao'); }
+        if (a.disconnect.reload && now - discSince >= a.disconnect.after * 1000 && now - lastReload > 60000) {
+          lastReload = now;
+          try { sessionStorage.setItem('milk_reload', String(now)); } catch (_) {}
+          log('recarregando a pagina');
+          location.reload();
+        }
+      } else discSince = 0;
+    }
+    if (a.death.enabled) {
+      const present = list(a.death.texts).some(p => bt.includes(p));
+      if (present && !deathSeen) notify('Morte', 'A party foi derrotada');
+      deathSeen = present;
+    }
+    if (a.stamina.enabled) {
+      const v = readStamina();
+      if (v !== null) {
+        if (v <= a.stamina.below) {
+          if (!lowStamina) { lowStamina = true; notify('Stamina baixa', v + '%'); }
+        } else if (v > a.stamina.below + 5) lowStamina = false;
+      }
+    }
+  }
+
+  const ruleLast = {};
+  function tick() {
+    if (!cfg.master) return;
+    if (cfg.pauseWhenHidden && document.hidden) return;
+    const now = Date.now();
+    if (cfg.sell.enabled && now - lastSellCheck >= 1500) { lastSellCheck = now; checkSell(now); }
+    for (const r of cfg.rules) {
+      if (!r.enabled || sellBusy) continue;
+      if (now - (ruleLast[r.id] || 0) < Math.max(1, r.every) * 1000) continue;
+      ruleLast[r.id] = now;
+      const el = resolve({ texts: r.texts, sel: r.sel });
+      if (el) { humanClick(el); stats.clicks++; log(`regra "${r.name}" clicou`); }
+    }
+    watch(now);
+  }
+  function startTicker(fn, ms) {
+    let stop = () => {};
+    try {
+      const url = URL.createObjectURL(new Blob([`setInterval(()=>postMessage(1),${ms});`], { type: 'text/javascript' }));
+      const w = new Worker(url);
+      w.onmessage = fn;
+      w.onerror = ev => {
+        if (ev && ev.preventDefault) ev.preventDefault();
+        w.terminate();
+        const id = setInterval(fn, ms);
+        stop = () => clearInterval(id);
+      };
+      stop = () => { w.terminate(); URL.revokeObjectURL(url); };
+    } catch (_) {
+      const id = setInterval(fn, ms);
+      stop = () => clearInterval(id);
+    }
+    return () => stop();
+  }
+
+  let wakeLock = null;
+  async function applyWake() {
+    try {
+      if (cfg.keepAwake && 'wakeLock' in navigator && document.visibilityState === 'visible') {
+        if (!wakeLock) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          wakeLock.addEventListener('release', () => { wakeLock = null; });
+        }
+      } else if (wakeLock) { await wakeLock.release(); wakeLock = null; }
+    } catch (e) { log('tela ligada: ' + e.message); }
+  }
+
+  function cssPath(el) {
+    const parts = [];
+    let n = el;
+    while (n && n.nodeType === 1 && n !== document.body && parts.length < 6) {
+      if (n.id && document.querySelectorAll('#' + CSS.escape(n.id)).length === 1) { parts.unshift('#' + CSS.escape(n.id)); break; }
+      let part = n.tagName.toLowerCase();
+      const cls = [...n.classList].filter(c => !/\d{3,}|active|hover|selected|focus|open/i.test(c)).slice(0, 2);
+      if (cls.length) part += '.' + cls.map(c => CSS.escape(c)).join('.');
+      const sib = [...n.parentElement.children].filter(s => s.tagName === n.tagName);
+      if (sib.length > 1) part += `:nth-of-type(${sib.indexOf(n) + 1})`;
+      parts.unshift(part);
+      n = n.parentElement;
+    }
+    let path = parts.join(' > ');
+    try { if (document.querySelector(path) === el) return path; } catch (_) {}
+    const full = [];
+    n = el;
+    while (n && n.nodeType === 1 && n !== document.documentElement) {
+      full.unshift(`${n.tagName.toLowerCase()}:nth-child(${[...n.parentElement.children].indexOf(n) + 1})`);
+      n = n.parentElement;
+    }
+    return full.join(' > ');
+  }
+
+  const host = h('div', { id: HOST_ID });
+  const root = host.attachShadow({ mode: 'open' });
+  const style = h('style', {}, `
+    *{box-sizing:border-box;font-family:Segoe UI,Roboto,Arial,sans-serif}
+    .launch{position:fixed;right:14px;bottom:14px;width:46px;height:46px;border-radius:50%;background:#0b0b0b;border:2px solid #8b0000;color:#d11;font-weight:800;font-size:20px;cursor:pointer;z-index:2147483645;display:flex;align-items:center;justify-content:center;box-shadow:0 0 12px rgba(139,0,0,.6);user-select:none}
+    .panel{position:fixed;left:8px;top:8px;width:min(380px,94vw);max-height:84vh;display:none;flex-direction:column;background:#0b0b0b;color:#e8e8e8;border:1px solid #6b0000;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.85);z-index:2147483645;font-size:13px}
+    .panel.open{display:flex}
+    .head{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#150404;border-bottom:1px solid #6b0000;cursor:move;border-radius:10px 10px 0 0;touch-action:none;user-select:none}
+    .title{font-weight:800;letter-spacing:.5px;color:#e01b1b}
+    .sub{font-size:11px;color:#a66;margin-top:2px}
+    .tabs{display:flex;background:#0f0f0f;border-bottom:1px solid #3a0a0a;overflow-x:auto}
+    .tab{flex:1;padding:9px 6px;background:none;border:0;color:#9a8a8a;cursor:pointer;font-size:12px;white-space:nowrap;border-bottom:2px solid transparent}
+    .tab.on{color:#ff3b3b;border-bottom-color:#b00000;background:#140606}
+    .body{padding:10px;overflow-y:auto;display:flex;flex-direction:column;gap:9px}
+    .row{display:flex;flex-direction:column;gap:4px}
+    .row>label,.bt{font-size:11px;color:#c77;text-transform:uppercase;letter-spacing:.4px}
+    .blk{border:1px solid #3a0a0a;background:#111;border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:6px}
+    .line{display:flex;gap:5px;flex-wrap:wrap}
+    .line input{flex:1 1 120px}
+    input[type=text],input[type=number],select,textarea{width:100%;background:#050505;color:#eee;border:1px solid #4a0d0d;border-radius:6px;padding:8px;font-size:13px;outline:none}
+    input:focus,select:focus,textarea:focus{border-color:#c00}
+    input[type=number]{width:100px}
+    textarea{min-height:90px;resize:vertical;font-family:Consolas,monospace;font-size:11px}
+    .chk{display:flex;align-items:center;gap:8px;color:#ddd;font-size:13px;padding:4px 0}
+    .chk input{accent-color:#b00000;width:18px;height:18px}
+    .btn{background:#2a0606;color:#f2d0d0;border:1px solid #7a0c0c;border-radius:6px;padding:8px 12px;cursor:pointer;font-size:12px}
+    .btn:active{background:#550a0a}
+    .btn.sm{padding:6px 9px;font-size:11px}
+    .btn.ghost{background:#0b0b0b;border-color:#3a0a0a;color:#a88}
+    .btn.red{background:#8b0000;border-color:#c00;color:#fff}
+    .master{padding:14px;border-radius:8px;border:1px solid #7a0c0c;background:#1a0505;color:#e66;font-weight:800;font-size:15px;cursor:pointer;letter-spacing:1px}
+    .master.on{background:#8b0000;color:#fff;border-color:#e01b1b}
+    pre{margin:0;background:#050505;border:1px solid #3a0a0a;border-radius:6px;padding:8px;height:170px;overflow:auto;font-size:11px;color:#d9a0a0;white-space:pre-wrap;font-family:Consolas,monospace}
+    .note{font-size:11px;color:#8a6a6a;line-height:1.4}
+    .banner{position:fixed;left:50%;top:12px;transform:translateX(-50%);background:#8b0000;color:#fff;padding:10px 16px;border-radius:8px;z-index:2147483646;font-size:13px;display:none;box-shadow:0 4px 18px rgba(0,0,0,.7)}
+    .hi{position:fixed;z-index:2147483646;pointer-events:none;border:2px solid #ff1a1a;background:rgba(200,0,0,.18);display:none}
+  `);
+  const launch = h('div', { class: 'launch' }, 'M');
+  const panel = h('div', { class: 'panel' });
+  const statsEl = h('div', { class: 'sub' }, '');
+  const headBtn = h('button', { class: 'btn sm', onclick: () => panel.classList.remove('open') }, '–');
+  const head = h('div', { class: 'head' }, h('div', {}, h('div', { class: 'title' }, 'MILK · BAIAK BOT'), statsEl), headBtn);
+  const tabsEl = h('div', { class: 'tabs' });
+  const body = h('div', { class: 'body' });
+  const banner = h('div', { class: 'banner' }, '');
+  const hi = h('div', { class: 'hi' });
+  panel.append(head, tabsEl, body);
+  root.append(style, launch, panel, banner, hi);
+
+  launch.addEventListener('click', () => panel.classList.toggle('open'));
+  head.addEventListener('pointerdown', e => {
+    if (e.target.closest('button')) return;
+    const r = panel.getBoundingClientRect();
+    const dx = e.clientX - r.left, dy = e.clientY - r.top;
+    head.setPointerCapture(e.pointerId);
+    const mv = ev => {
+      panel.style.left = Math.min(Math.max(0, ev.clientX - dx), innerWidth - 60) + 'px';
+      panel.style.top = Math.min(Math.max(0, ev.clientY - dy), innerHeight - 40) + 'px';
+    };
+    const up = () => { head.removeEventListener('pointermove', mv); head.removeEventListener('pointerup', up); };
+    head.addEventListener('pointermove', mv);
+    head.addEventListener('pointerup', up);
+  });
+
+  const row = (label, ...ctl) => h('div', { class: 'row' }, h('label', {}, label), ...ctl);
+  const input = (obj, key, opts = {}) => {
+    const i = h('input', { type: opts.type || 'text', placeholder: opts.ph || '' });
+    if (opts.type === 'number') { i.min = opts.min ?? 0; i.max = opts.max ?? 99999; }
+    i.value = obj[key];
+    i.addEventListener('input', () => {
+      obj[key] = opts.type === 'number' ? (Number(i.value) || 0) : i.value;
+      save();
+    });
+    return i;
+  };
+  const check = (obj, key, text, after) => {
+    const c = h('input', { type: 'checkbox' });
+    c.checked = !!obj[key];
+    c.addEventListener('change', () => { obj[key] = c.checked; save(); if (after) after(); });
+    return h('label', { class: 'chk' }, c, text);
+  };
+  const targetBlock = (title, t) => {
+    const tx = input(t, 'texts', { ph: 'textos separados por virgula' });
+    const sl = input(t, 'sel', { ph: 'seletor CSS (opcional)' });
+    const pick = h('button', { class: 'btn sm', onclick: () => startPick(path => { t.sel = path; sl.value = path; save(); log(`alvo "${title}" marcado`); }) }, 'alvo');
+    const test = h('button', { class: 'btn sm', onclick: () => testTarget(title, t) }, 'testar');
+    const clr = h('button', { class: 'btn sm ghost', onclick: () => { t.sel = ''; sl.value = ''; save(); } }, 'limpar');
+    return h('div', { class: 'blk' }, h('div', { class: 'bt' }, title), tx, h('div', { class: 'line' }, sl, pick, test, clr));
+  };
+
+  let picking = false;
+  function startPick(cb) {
+    if (picking) return;
+    picking = true;
+    panel.style.visibility = 'hidden';
+    launch.style.visibility = 'hidden';
+    banner.textContent = 'Toque/clique no elemento. Esc cancela.';
+    banner.style.display = 'block';
+    const finish = el => {
+      picking = false;
+      window.removeEventListener('pointerdown', down, true);
+      window.removeEventListener('mousemove', move, true);
+      window.removeEventListener('keydown', key, true);
+      hi.style.display = 'none';
+      banner.style.display = 'none';
+      panel.style.visibility = '';
+      launch.style.visibility = '';
+      if (el) cb(cssPath(el));
+    };
+    const swallow = ev => { ev.preventDefault(); ev.stopImmediatePropagation(); };
+    const move = ev => {
+      const t = ev.target;
+      if (!t || t === host || t === document.documentElement) return;
+      const r = t.getBoundingClientRect();
+      Object.assign(hi.style, { display: 'block', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+    };
+    const down = ev => {
+      swallow(ev);
+      const t = ev.target;
+      const evs = ['pointerup', 'mouseup', 'click', 'touchstart', 'touchend'];
+      evs.forEach(n => window.addEventListener(n, swallow, true));
+      setTimeout(() => evs.forEach(n => window.removeEventListener(n, swallow, true)), 600);
+      finish(t === host || t === document.documentElement ? null : t);
+    };
+    const key = ev => { if (ev.key === 'Escape') { swallow(ev); finish(null); } };
+    window.addEventListener('pointerdown', down, true);
+    window.addEventListener('mousemove', move, true);
+    window.addEventListener('keydown', key, true);
+  }
+
+  function tabGeral() {
+    const mb = h('button', { class: 'master' });
+    const upd = () => { mb.textContent = cfg.master ? 'BOT LIGADO' : 'BOT DESLIGADO'; mb.classList.toggle('on', cfg.master); };
+    mb.addEventListener('click', () => { cfg.master = !cfg.master; save(); upd(); log(cfg.master ? 'bot ligado' : 'bot desligado'); });
+    upd();
+    logEl = h('pre', {}, logs.join('\n'));
+    return [
+      mb,
+      h('button', { class: 'btn', onclick: hidePanel }, 'Modo stream: esconder agora'),
+      row('Log', logEl),
+      h('button', { class: 'btn ghost', onclick: () => { logs.length = 0; logEl.textContent = ''; } }, 'limpar log'),
+      h('div', { class: 'note' }, 'Os textos padrao dos botoes sao estimativas. Em cada aba use "testar" ou "alvo" para confirmar que o bot enxerga o botao certo do jogo.'),
+    ];
+  }
+  function tabSell() {
+    const s = cfg.sell;
+    const mode = h('select', {}, h('option', { value: 'full' }, 'Quando a backpack encher'), h('option', { value: 'timer' }, 'Por tempo'));
+    mode.value = s.mode;
+    mode.addEventListener('change', () => { s.mode = mode.value; save(); });
+    const counterSel = input(s, 'counterSel', { ph: 'seletor do contador (ex: 12/20) - opcional' });
+    const pickCounter = h('button', { class: 'btn sm', onclick: () => startPick(p => { s.counterSel = p; counterSel.value = p; save(); log('contador marcado'); }) }, 'alvo');
+    const readBtn = h('button', { class: 'btn sm', onclick: () => {
+      const c = readCounter();
+      log(c ? `backpack lida: ${c.cur}/${c.max} (${Math.round(c.cur / c.max * 100)}%)` : 'backpack: contador nao encontrado');
+    } }, 'ler');
+    const all = h('button', { class: 'btn red', onclick: () => {
+      readBtn.click();
+      testTarget('abrir backpack', s.open); testTarget('vender', s.sell); testTarget('confirmar', s.confirm); testTarget('fechar', s.close);
+    } }, 'Testar tudo');
+    const now = h('button', { class: 'btn', onclick: () => { log('sell manual'); doSell('manual'); } }, 'Vender agora');
+    return [
+      check(s, 'enabled', 'Auto Sell ativo'),
+      row('Modo', mode),
+      row('Vender com a backpack em (%)', input(s, 'threshold', { type: 'number', min: 1, max: 100 })),
+      row('Intervalo no modo tempo (s)', input(s, 'interval', { type: 'number', min: 5 })),
+      row('Contador da backpack', h('div', { class: 'line' }, counterSel, pickCounter, readBtn)),
+      row('Textos que indicam backpack cheia', input(s, 'fullTexts', { ph: 'separados por virgula' })),
+      targetBlock('Abrir backpack (so se precisar)', s.open),
+      targetBlock('Botao vender tudo', s.sell),
+      targetBlock('Confirmar venda', s.confirm),
+      targetBlock('Fechar backpack', s.close),
+      h('div', { class: 'line' }, all, now),
+    ];
+  }
+  function tabRules() {
+    const wrap = h('div', { class: 'body', style: 'padding:0;overflow:visible' });
+    const render = () => {
+      wrap.replaceChildren();
+      for (const r of cfg.rules) {
+        const tx = input(r, 'texts', { ph: 'textos separados por virgula' });
+        const sl = input(r, 'sel', { ph: 'seletor CSS (opcional)' });
+        wrap.append(h('div', { class: 'blk' },
+          h('div', { class: 'line' }, input(r, 'name'), h('button', { class: 'btn sm ghost', onclick: () => { cfg.rules = cfg.rules.filter(x => x !== r); save(); render(); } }, 'excluir')),
+          check(r, 'enabled', 'Ativa'),
+          tx,
+          h('div', { class: 'line' }, sl,
+            h('button', { class: 'btn sm', onclick: () => startPick(p => { r.sel = p; sl.value = p; save(); log(`alvo "${r.name}" marcado`); }) }, 'alvo'),
+            h('button', { class: 'btn sm', onclick: () => testTarget(r.name, { texts: r.texts, sel: r.sel }) }, 'testar')),
+          row('Checar a cada (s)', input(r, 'every', { type: 'number', min: 1 }))));
+      }
+      wrap.append(h('button', { class: 'btn red', onclick: () => {
+        cfg.rules.push({ id: 'r' + Date.now(), name: 'Nova regra', enabled: false, every: 5, texts: '', sel: '' });
+        save(); render();
+      } }, '+ nova regra'));
+    };
+    render();
+    return [h('div', { class: 'note' }, 'Cada regra procura um botao visivel pelo texto (ou seletor) e clica nele no intervalo definido.'), wrap];
+  }
+  function tabAlerts() {
+    const a = cfg.alerts;
+    const perm = h('button', { class: 'btn', onclick: async () => {
+      try { log('notificacoes: ' + await Notification.requestPermission()); } catch (e) { log('notificacoes indisponiveis'); }
+    } }, 'Permitir notificacoes');
+    const stam = h('button', { class: 'btn sm', onclick: () => {
+      const v = readStamina();
+      log(v === null ? 'stamina: leitura nao encontrada' : `stamina lida: ${v}%`);
+    } }, 'ler stamina');
+    return [
+      check(a, 'sound', 'Som de alerta'),
+      check(a, 'notify', 'Notificacao do sistema'),
+      perm,
+      h('div', { class: 'blk' }, h('div', { class: 'bt' }, 'Desconexao'),
+        check(a.disconnect, 'enabled', 'Vigiar'),
+        input(a.disconnect, 'texts', { ph: 'textos do aviso' }),
+        check(a.disconnect, 'reload', 'Recarregar a pagina'),
+        row('Recarregar apos (s)', input(a.disconnect, 'after', { type: 'number', min: 5 }))),
+      h('div', { class: 'blk' }, h('div', { class: 'bt' }, 'Morte da party'),
+        check(a.death, 'enabled', 'Vigiar'),
+        input(a.death, 'texts', { ph: 'textos do aviso' })),
+      h('div', { class: 'blk' }, h('div', { class: 'bt' }, 'Stamina'),
+        check(a.stamina, 'enabled', 'Alertar'),
+        row('Alertar em (%) ou menos', input(a.stamina, 'below', { type: 'number', min: 1, max: 100 })),
+        stam),
+    ];
+  }
+  function keyButton(prop) {
+    const b = h('button', { class: 'btn' }, cfg[prop]);
+    b.addEventListener('click', () => {
+      b.textContent = 'pressione uma tecla...';
+      capturing = code => { if (code) { cfg[prop] = code; save(); } b.textContent = cfg[prop]; };
+    });
+    return b;
+  }
+  function tabExtras() {
+    const statsBox = h('div', { class: 'blk' });
+    const refresh = () => {
+      const elapsed = Math.floor((Date.now() - stats.start) / 1000);
+      statsBox.replaceChildren(
+        h('div', { class: 'bt' }, 'Resumo desta sessão'),
+        h('div', { class: 'note' }, `Cliques: ${stats.clicks}\nVendas: ${stats.sells}\nTempo ativo nesta página: ${pad(Math.floor(elapsed / 3600))}:${pad(Math.floor(elapsed / 60) % 60)}:${pad(elapsed % 60)}`)
+      );
+    };
+    refresh();
+    const exportLogs = () => {
+      const content = logs.length ? logs.join('\n') : 'Nenhum registro nesta sessão.';
+      const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+      const a = h('a', { href: url, download: `milk-baiak-log-${new Date().toISOString().slice(0,10)}.txt` });
+      document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      log('log exportado');
+    };
+    return [
+      statsBox,
+      check(cfg, 'pauseWhenHidden', 'Pausar automações quando a aba do jogo ficar em segundo plano'),
+      h('div', { class: 'note' }, 'Quando ativado, o bot não executa vendas nem cliques enquanto outra aba/app estiver em primeiro plano. Os alertas também ficam pausados nesse período.'),
+      h('div', { class: 'line' },
+        h('button', { class: 'btn', onclick: () => { refresh(); log('resumo atualizado'); } }, 'Atualizar resumo'),
+        h('button', { class: 'btn', onclick: exportLogs }, 'Exportar log')),
+      h('button', { class: 'btn ghost', onclick: () => {
+        if (!confirm('Zerar os contadores desta sessão?')) return;
+        stats.clicks = 0; stats.sells = 0; stats.start = Date.now(); refresh(); log('contadores da sessão zerados');
+      } }, 'Zerar contadores da sessão'),
+      h('button', { class: 'btn ghost', onclick: () => { beep(); log('som de teste'); } }, 'Testar som de alerta'),
+    ];
+  }
+
+  function tabConfig() {
+    const op = h('input', { type: 'range', min: 40, max: 100 });
+    op.value = cfg.opacity;
+    op.addEventListener('input', () => { cfg.opacity = +op.value; host.style.opacity = cfg.opacity / 100; save(); });
+    const ta = h('textarea', {});
+    ta.value = JSON.stringify(cfg, null, 1);
+    return [
+      h('div', { class: 'blk' }, h('div', { class: 'bt' }, 'Modo stream'),
+        row('Tecla para esconder', keyButton('hideKey')),
+        row('Tecla para mostrar', keyButton('showKey')),
+        h('button', { class: 'btn', onclick: hidePanel }, 'Esconder agora'),
+        h('div', { class: 'note' }, 'Escondido, o bot continua rodando. Teclas iguais alternam. No celular, toque 5 vezes no canto superior esquerdo para mostrar.')),
+      check(cfg, 'keepAwake', 'Manter tela ligada', applyWake),
+      row('Opacidade do painel', op),
+      row('Exportar / importar configuracao', ta),
+      h('div', { class: 'line' },
+        h('button', { class: 'btn', onclick: () => { try { navigator.clipboard.writeText(ta.value); log('config copiada'); } catch (_) { ta.select(); } } }, 'copiar'),
+        h('button', { class: 'btn', onclick: () => {
+          try { cfg = merge(DEFAULTS, JSON.parse(ta.value)); save(); log('config importada'); setTab('config'); }
+          catch (_) { log('JSON invalido'); }
+        } }, 'importar'),
+        h('button', { class: 'btn ghost', onclick: () => { cfg = clone(DEFAULTS); save(); log('config resetada'); setTab('config'); } }, 'resetar')),
+    ];
+  }
+  const TABS = [['geral', 'Geral', tabGeral], ['sell', 'Sell', tabSell], ['rules', 'Cliques', tabRules], ['alerts', 'Alertas', tabAlerts], ['extras', 'Extras', tabExtras], ['config', 'Config', tabConfig]];
+  function setTab(id) {
+    logEl = null;
+    for (const b of tabsEl.children) b.classList.toggle('on', b.dataset.id === id);
+    const t = TABS.find(x => x[0] === id);
+    body.replaceChildren(...t[2]());
+  }
+  for (const [id, label] of TABS) tabsEl.append(h('button', { class: 'tab', 'data-id': id, onclick: () => setTab(id) }, label));
+
+  let hidden = false, capturing = null;
+  const taps = [];
+  function hidePanel() { hidden = true; host.style.display = 'none'; log('modo stream: escondido'); }
+  function showPanel() { hidden = false; host.style.display = ''; panel.classList.add('open'); log('modo stream: visivel'); }
+  function onKey(e) {
+    if (capturing) {
+      e.preventDefault(); e.stopPropagation();
+      const cb = capturing; capturing = null;
+      cb(e.code === 'Escape' ? null : e.code);
+      return;
+    }
+    const src = e.composedPath ? e.composedPath()[0] : e.target;
+    if (src && (src.tagName === 'INPUT' || src.tagName === 'TEXTAREA' || src.isContentEditable)) return;
+    if (cfg.hideKey === cfg.showKey && e.code === cfg.hideKey) { e.preventDefault(); hidden ? showPanel() : hidePanel(); return; }
+    if (e.code === cfg.hideKey && !hidden) { e.preventDefault(); hidePanel(); }
+    else if (e.code === cfg.showKey && hidden) { e.preventDefault(); showPanel(); }
+  }
+  function onTap(e) {
+    if (!hidden || e.clientX > 70 || e.clientY > 70) return;
+    const now = Date.now();
+    taps.push(now);
+    while (taps.length && now - taps[0] > 2500) taps.shift();
+    if (taps.length >= 5) { taps.length = 0; showPanel(); }
+  }
+  window.addEventListener('keydown', onKey, true);
+  window.addEventListener('pointerdown', onTap, true);
+
+  document.documentElement.append(host);
+  host.style.opacity = cfg.opacity / 100;
+  setTab('geral');
+  const statsTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - stats.start) / 1000);
+    statsEl.textContent = `cliques ${stats.clicks} · vendas ${stats.sells} · ${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+  }, 1000);
+  const stopTicker = startTicker(tick, 500);
+  document.addEventListener('visibilitychange', applyWake);
+  applyWake();
+  log('bot carregado (desligado). abra a aba Sell e teste os botoes.');
+
+  window.__milkBaiak = {
+    destroy() {
+      stopTicker();
+      clearInterval(statsTimer);
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('pointerdown', onTap, true);
+      document.removeEventListener('visibilitychange', applyWake);
+      if (wakeLock) { try { wakeLock.release(); } catch (_) {} }
+      host.remove();
+    },
+  };
+})();
